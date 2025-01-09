@@ -1,295 +1,196 @@
 const WebSocket = require('ws');
 const os = require('os');
-const { exec } = require('child_process');
 
-// Obtener IP local
+// Función para obtener IP local
 function getLocalIP() {
-    const interfaces = os.networkInterfaces();
-    for (const ifname of Object.keys(interfaces)) {
-        for (const iface of interfaces[ifname]) {
-            if (iface.family === 'IPv4' && !iface.internal) {
-                return iface.address;
-            }
-        }
+  const interfaces = os.networkInterfaces();
+  for (const iface of Object.values(interfaces)) {
+    for (const alias of iface) {
+      if (alias.family === 'IPv4' && !alias.internal) {
+        return alias.address;
+      }
     }
-    return '0.0.0.0';
+  }
+  return '0.0.0.0';
 }
 
 const localIP = getLocalIP();
 const PORT = process.env.PORT || 8080;
 
-console.log('IP local detectada:', localIP);
-console.log(`Servidor WebRTC corriendo en puerto ${PORT}`);
-console.log('Para crear túnel, ejecuta en otra terminal:');
-console.log(`tunnelmole --port ${PORT}`);
+console.log('=================================');
+console.log('Servidor WebRTC iniciado en:');
+console.log(`ws://${localIP}:${PORT}`);
+console.log('=================================');
 
-const wss = new WebSocket.Server({ 
-    port: PORT,
-    clientTracking: true,
-    handleProtocols: () => 'websocket',
-    perMessageDeflate: {
-        zlibDeflateOptions: {
-            chunkSize: 1024,
-            memLevel: 7,
-            level: 3
-        },
-        zlibInflateOptions: {
-            chunkSize: 10 * 1024
-        }
+// Configuración del servidor
+const wss = new WebSocket.Server({ port: PORT });
+
+// Estado global
+const rooms = new Map();
+const userSessions = new Map();
+const userReconnectTimers = new Map();
+
+// Configuración de reconexión
+const RECONNECT_TIMEOUT = 30000; // 30 segundos para limpiar usuario si no reconecta
+
+wss.on('connection', (ws) => {
+  console.log('Nueva conexión entrante');
+  
+  ws.isAlive = true;
+  ws.on('pong', () => { ws.isAlive = true; });
+
+  ws.on('message', (message) => {
+    try {
+      const data = JSON.parse(message);
+      console.log('Mensaje recibido:', data);
+      
+      switch(data.type) {
+        case 'join':
+          handleJoin(ws, data);
+          break;
+        case 'signal':
+          handleSignal(ws, data);
+          break;
+        case 'ping':
+          ws.send(JSON.stringify({type: 'pong'}));
+          break;
+      }
+    } catch (err) {
+      console.error('Error procesando mensaje:', err);
     }
+  });
+
+  ws.on('close', () => handleDisconnect(ws));
+  ws.on('error', console.error);
 });
 
-const rooms = new Map();
-const clientRooms = new Map();
+function handleJoin(ws, data) {
+  const { roomId, userId } = data;
+  
+  // Limpiar timer de reconexión si existe
+  clearReconnectTimer(userId);
+  
+  // Manejar sesión existente
+  const existingWs = userSessions.get(userId);
+  if (existingWs && existingWs !== ws) {
+    console.log(`Usuario ${userId} reconectando, limpiando sesión anterior`);
+    existingWs.close();
+    userSessions.delete(userId);
+  }
 
-// Añadir heartbeat para detectar conexiones muertas
-function setupHeartbeat(ws) {
-  ws.isAlive = true;
-  ws.on('pong', () => {
-    ws.isAlive = true;
+  // Registrar nueva sesión
+  ws.userId = userId;
+  ws.roomId = roomId;
+  userSessions.set(userId, ws);
+
+  // Manejar sala
+  let room = rooms.get(roomId);
+  if (!room) {
+    room = new Set();
+    rooms.set(roomId, room);
+  }
+
+  room.add(userId);
+  console.log(`Usuario ${userId} unido a sala ${roomId}`);
+
+  // Notificar estado de sala
+  broadcastToRoom(roomId, {
+    type: 'room_status',
+    users: Array.from(room),
+    joined: userId
   });
 }
 
-// Verificar conexiones activas cada 30 segundos
-const interval = setInterval(() => {
+function handleSignal(ws, data) {
+  const { target, signal } = data;
+  const targetWs = userSessions.get(target);
+  
+  if (targetWs?.readyState === WebSocket.OPEN) {
+    targetWs.send(JSON.stringify({
+      type: 'signal',
+      from: ws.userId,
+      signal
+    }));
+  }
+}
+
+function handleDisconnect(ws) {
+  const { userId, roomId } = ws;
+  if (!userId || !roomId) return;
+
+  console.log(`Usuario ${userId} desconectado de sala ${roomId}`);
+
+  // Iniciar timer de reconexión
+  setReconnectTimer(userId, roomId);
+
+  // No eliminar inmediatamente de la sala, esperar el timeout
+  broadcastToRoom(roomId, {
+    type: 'peer_disconnected',
+    userId,
+    temporary: true
+  });
+}
+
+function setReconnectTimer(userId, roomId) {
+  const timer = setTimeout(() => {
+    console.log(`Timeout de reconexión para usuario ${userId}`);
+    finalizeDisconnect(userId, roomId);
+  }, RECONNECT_TIMEOUT);
+
+  userReconnectTimers.set(userId, timer);
+}
+
+function clearReconnectTimer(userId) {
+  const timer = userReconnectTimers.get(userId);
+  if (timer) {
+    clearTimeout(timer);
+    userReconnectTimers.delete(userId);
+  }
+}
+
+function finalizeDisconnect(userId, roomId) {
+  userSessions.delete(userId);
+  const room = rooms.get(roomId);
+  
+  if (room) {
+    room.delete(userId);
+    if (room.size === 0) {
+      rooms.delete(roomId);
+      console.log(`Sala ${roomId} eliminada`);
+    } else {
+      broadcastToRoom(roomId, {
+        type: 'peer_disconnected',
+        userId,
+        temporary: false
+      });
+    }
+  }
+}
+
+function broadcastToRoom(roomId, message) {
+  const room = rooms.get(roomId);
+  if (!room) return;
+
+  const messageStr = JSON.stringify(message);
+  room.forEach(userId => {
+    const ws = userSessions.get(userId);
+    if (ws?.readyState === WebSocket.OPEN) {
+      ws.send(messageStr);
+    }
+  });
+}
+
+// Mantenimiento de conexiones
+setInterval(() => {
   wss.clients.forEach(ws => {
     if (ws.isAlive === false) {
       handleDisconnect(ws);
       return ws.terminate();
     }
     ws.isAlive = false;
-    ws.ping(() => {});
-  });
-}, 30000);
-
-wss.on('close', () => {
-  clearInterval(interval);
-});
-
-// Mejorar el manejo de mensajes
-wss.on('connection', (ws) => {
-  ws.id = Math.random().toString(36).substr(2, 9);
-  console.log(`Nueva conexión establecida (ID: ${ws.id})`);
-  
-  ws.isAlive = true;
-  setupHeartbeat(ws);
-
-  ws.on('message', (message) => {
-    try {
-      const data = JSON.parse(message);
-      console.log(`Cliente ${ws.id} envió mensaje:`, data);
-
-      switch (data.type) {
-        case 'join':
-          handleJoinRoom(ws, data.roomId);
-          break;
-          
-        case 'ping':
-          ws.isAlive = true;
-          ws.send(JSON.stringify({ type: 'pong' }));
-          break;
-          
-        case 'offer':
-          handleSignaling(ws, data);
-          break;
-          
-        case 'answer':
-          handleSignaling(ws, data);
-          break;
-          
-        case 'ice-candidate':
-          handleSignaling(ws, data);
-          break;
-          
-        case 'leave':
-          handleLeaveRoom(ws);
-          break;
-          
-        default:
-          console.warn(`Tipo de mensaje no manejado: ${data.type}`);
-      }
-    } catch (error) {
-      console.error('Error procesando mensaje:', error);
-    }
-  });
-
-  ws.on('close', () => handleDisconnect(ws));
-  ws.on('error', (error) => {
-    console.error('Error en WebSocket:', error);
-    handleDisconnect(ws);
-  });
-});
-
-// Mejorar manejo de salas
-function handleJoinRoom(ws, roomId) {
-  if (!roomId) {
-    console.log('Intento de unirse a sala sin ID');
-    return;
-  }
-  
-  console.log(`Procesando solicitud de unión a sala ${roomId} para cliente ${ws.id}`);
-
-  // Verificar si la sala existe y tiene espacio
-  const room = rooms.get(roomId);
-  if (room && room.size >= 2) {
-    console.log(`Sala ${roomId} llena, rechazando conexión`);
-    ws.send(JSON.stringify({
-      type: 'error',
-      message: 'room_full'
-    }));
-    return;
-  }
-
-  // Crear nueva sala si no existe
-  if (!rooms.has(roomId)) {
-    console.log(`Creando nueva sala: ${roomId}`);
-    rooms.set(roomId, new Set());
-  }
-
-  // Limpiar conexiones anteriores del mismo cliente
-  const existingRoom = rooms.get(roomId);
-  existingRoom.forEach(client => {
-    if (client.id === ws.id && client !== ws) {
-      console.log(`Eliminando conexión duplicada del cliente ${client.id}`);
-      handleDisconnect(client);
-    }
-  });
-
-  // Añadir cliente a la sala
-  existingRoom.add(ws);
-  ws.roomId = roomId;
-  clientRooms.set(ws, roomId);
-
-  // Notificar estado actualizado
-  broadcastToRoom(roomId, {
-    type: 'room_status',
-    roomId,
-    peerCount: existingRoom.size
-  });
-}
-
-function handleLeaveRoom(ws) {
-  const roomId = clientRooms.get(ws);
-  if (!roomId) return;
-  
-  const room = rooms.get(roomId);
-  if (room) {
-    room.delete(ws);
-    
-    // Si la sala queda vacía, eliminarla
-    if (room.size === 0) {
-      rooms.delete(roomId);
-      console.log(`Sala eliminada: ${roomId}`);
-    } else {
-      // Notificar a los peers restantes
-      broadcastToRoom(roomId, {
-        type: 'peer-left',
-        roomId,
-        peerCount: room.size
-      });
-    }
-  }
-  
-  clientRooms.delete(ws);
-  ws.roomId = null;
-}
-
-function handleDisconnect(ws) {
-  const roomId = ws.roomId;
-  if (roomId) {
-    const room = rooms.get(roomId);
-    if (room) {
-      console.log(`Cliente ${ws.id} desconectándose de sala ${roomId}`);
-      
-      // Eliminar cliente de la sala inmediatamente
-      room.delete(ws);
-      
-      // Notificar a los clientes restantes antes de eliminar la sala
-      if (room.size > 0) {
-        broadcastToRoom(roomId, {
-          type: 'peer-left',
-          roomId,
-          peerCount: room.size
-        });
-      }
-      
-      // Si la sala está vacía, eliminarla
-      if (room.size === 0) {
-        console.log(`Eliminando sala vacía: ${roomId}`);
-        rooms.delete(roomId);
-      }
-    }
-    
-    clientRooms.delete(ws);
-    ws.roomId = null;
-  }
-
-  // Limpiar recursos del cliente
-  ws.isAlive = false;
-  ws.terminate();
-}
-
-function broadcastToRoom(roomId, message) {
-  const room = rooms.get(roomId);
-  if (!room) return;
-  
-  const messageStr = JSON.stringify(message);
-  room.forEach(client => {
-    if (client.readyState === WebSocket.OPEN) {
-      client.send(messageStr);
-    }
-  });
-}
-
-// Verificar periódicamente conexiones muertas
-setInterval(() => {
-  wss.clients.forEach(ws => {
-    if (!ws.isAlive) {
-      handleDisconnect(ws);
-      return;
-    }
-    ws.isAlive = false;
     ws.ping();
   });
-}, 30000);
+}, 15000);
 
-function handleSignaling(ws, data) {
-  const roomId = clientRooms.get(ws);
-  if (!roomId) return;
-  
-  const room = rooms.get(roomId);
-  if (!room) return;
-
-  // Solo enviar a otros clientes en la misma sala
-  const clientCount = room.size;
-  console.log(`Reenviando mensaje ${data.type} a ${clientCount - 1} clientes en sala ${roomId}`);
-  
-  room.forEach(client => {
-    if (client !== ws && client.readyState === WebSocket.OPEN) {
-      client.send(JSON.stringify(data));
-    }
-  });
-}
-
-// Modificar el intervalo de ping para ser más eficiente
-const heartbeatInterval = setInterval(() => {
-  wss.clients.forEach(ws => {
-    if (ws.isAlive === false) {
-      // Solo terminar si no hay actividad por dos intervalos
-      if (ws.lastPing === false) {
-        console.log(`Terminando conexión inactiva (ID: ${ws.id})`);
-        handleDisconnect(ws);
-        return ws.terminate();
-      }
-      ws.lastPing = false;
-    } else {
-      ws.lastPing = true;
-    }
-    ws.isAlive = false;
-    ws.ping();
-  });
-}, 30000);
-
-wss.on('close', () => {
-  clearInterval(heartbeatInterval);
-});
+// Log de inicio
+console.log(`Servidor WebRTC corriendo en puerto ${PORT}`);
