@@ -35,6 +35,7 @@ const RECONNECT_TIMEOUT = 30000; // 30 segundos para limpiar usuario si no recon
 
 wss.on('connection', (ws) => {
   console.log('Nueva conexión entrante');
+  ws.id = Math.random().toString(36).substr(2, 9); // Añadir ID único
   
   ws.isAlive = true;
   ws.on('pong', () => { ws.isAlive = true; });
@@ -48,8 +49,10 @@ wss.on('connection', (ws) => {
         case 'join':
           handleJoin(ws, data);
           break;
-        case 'signal':
-          handleSignal(ws, data);
+        case 'offer':
+        case 'answer':
+        case 'ice-candidate':
+          broadcastToRoom(data.roomId, JSON.stringify(data), ws);
           break;
         case 'ping':
           ws.send(JSON.stringify({type: 'pong'}));
@@ -65,53 +68,28 @@ wss.on('connection', (ws) => {
 });
 
 function handleJoin(ws, data) {
-  const { roomId, userId } = data;
+  const { roomId } = data;
   
-  // Limpiar timer de reconexión si existe
-  clearReconnectTimer(userId);
-  
-  // Manejar sesión existente
-  const existingWs = userSessions.get(userId);
-  if (existingWs && existingWs !== ws) {
-    console.log(`Usuario ${userId} reconectando, limpiando sesión anterior`);
-    existingWs.close();
-    userSessions.delete(userId);
-  }
-
-  // Registrar nueva sesión
-  ws.userId = userId;
   ws.roomId = roomId;
-  userSessions.set(userId, ws);
-
-  // Manejar sala
   let room = rooms.get(roomId);
+  
   if (!room) {
     room = new Set();
     rooms.set(roomId, room);
   }
 
-  room.add(userId);
-  console.log(`Usuario ${userId} unido a sala ${roomId}`);
+  // Si ya hay alguien en la sala, notificar a todos
+  if (room.size > 0) {
+    broadcastToRoom(roomId, JSON.stringify({
+      type: 'user_joined',
+      userId: ws.id
+    }));
+  }
 
-  // Notificar estado de sala
-  broadcastToRoom(roomId, {
-    type: 'room_status',
-    users: Array.from(room),
-    joined: userId
-  });
+  room.add(ws.id);
+  userSessions.set(ws.id, ws);
 
-  // Notificar a todos los usuarios existentes
-  room.forEach(existingUserId => {
-    if (existingUserId !== userId) {
-      const existingWs = userSessions.get(existingUserId);
-      if (existingWs?.readyState === WebSocket.OPEN) {
-        existingWs.send(JSON.stringify({
-          type: 'new_peer',
-          peerId: userId
-        }));
-      }
-    }
-  });
+  console.log(`Usuario ${ws.id} unido a sala ${roomId}. Total usuarios: ${room.size}`);
 }
 
 function handleSignal(ws, data) {
@@ -189,15 +167,16 @@ function finalizeDisconnect(userId, roomId) {
   }
 }
 
-function broadcastToRoom(roomId, message) {
+function broadcastToRoom(roomId, message, sender) {
   const room = rooms.get(roomId);
   if (!room) return;
 
-  const messageStr = JSON.stringify(message);
+  console.log(`Transmitiendo mensaje a sala ${roomId} (${room.size} usuarios)`);
+
   room.forEach(userId => {
     const ws = userSessions.get(userId);
-    if (ws?.readyState === WebSocket.OPEN) {
-      ws.send(messageStr);
+    if (ws && ws.readyState === WebSocket.OPEN && (!sender || ws !== sender)) {
+      ws.send(message);
     }
   });
 }
