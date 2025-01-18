@@ -99,6 +99,19 @@ function handleJoin(ws, data) {
     users: Array.from(room),
     joined: userId
   });
+
+  // Notificar a todos los usuarios existentes
+  room.forEach(existingUserId => {
+    if (existingUserId !== userId) {
+      const existingWs = userSessions.get(existingUserId);
+      if (existingWs?.readyState === WebSocket.OPEN) {
+        existingWs.send(JSON.stringify({
+          type: 'new_peer',
+          peerId: userId
+        }));
+      }
+    }
+  });
 }
 
 function handleSignal(ws, data) {
@@ -106,11 +119,20 @@ function handleSignal(ws, data) {
   const targetWs = userSessions.get(target);
   
   if (targetWs?.readyState === WebSocket.OPEN) {
+    // Añadir logs para depuración
+    console.log('Señalización enviada:', {
+      from: ws.userId,
+      to: target,
+      type: signal.type
+    });
+    
     targetWs.send(JSON.stringify({
       type: 'signal',
       from: ws.userId,
       signal
     }));
+  } else {
+    console.log('Usuario objetivo no encontrado o desconectado:', target);
   }
 }
 
