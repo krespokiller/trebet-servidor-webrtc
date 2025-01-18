@@ -70,46 +70,42 @@ wss.on('connection', (ws) => {
 function handleJoin(ws, data) {
   const { roomId } = data;
   
-  // Si el usuario ya estaba en una sala, limpiarlo primero
-  if (ws.roomId) {
-    const oldRoom = rooms.get(ws.roomId);
-    if (oldRoom) {
-      oldRoom.delete(ws.id);
-      if (oldRoom.size === 0) {
-        rooms.delete(ws.roomId);
-      }
-    }
+  // Verificar si el usuario ya está en la sala
+  const existingRoom = rooms.get(roomId);
+  if (existingRoom?.has(ws.id)) {
+    console.log(`Usuario ${ws.id} ya está en la sala ${roomId}`);
+    return;
   }
   
-  ws.roomId = roomId;
+  // Limpiar usuario de otras salas
+  rooms.forEach((room, rid) => {
+    if (room.has(ws.id)) {
+      room.delete(ws.id);
+      console.log(`Usuario ${ws.id} removido de sala anterior ${rid}`);
+    }
+  });
+
+  // Crear o unirse a sala
   let room = rooms.get(roomId);
-  
   if (!room) {
     room = new Set();
     rooms.set(roomId, room);
-  } else {
-    // Limpiar conexiones muertas antes de añadir el nuevo usuario
-    for (const userId of room) {
-      const existingWs = userSessions.get(userId);
-      if (!existingWs || existingWs.readyState !== WebSocket.OPEN) {
-        room.delete(userId);
-        userSessions.delete(userId);
-      }
-    }
   }
 
   room.add(ws.id);
   userSessions.set(ws.id, ws);
+  ws.roomId = roomId;
 
-  // Si ya hay alguien en la sala, notificar después de la limpieza
-  if (room.size > 1) {  // Cambiado de > 0 a > 1
+  // Notificar solo si hay más de un usuario
+  if (room.size > 1) {
+    console.log(`Notificando user_joined en sala ${roomId}`);
     broadcastToRoom(roomId, JSON.stringify({
       type: 'user_joined',
       userId: ws.id
-    }));
+    }), ws);
   }
 
-  console.log(`Usuario ${ws.id} unido a sala ${roomId}. Total usuarios activos: ${room.size}`);
+  console.log(`Usuario ${ws.id} unido a sala ${roomId}. Usuarios en sala: ${Array.from(room).join(', ')}`);
 }
 
 function handleSignal(ws, data) {
@@ -203,35 +199,15 @@ function broadcastToRoom(roomId, message, sender) {
   const room = rooms.get(roomId);
   if (!room) return;
 
-  // Contar usuarios activos primero
-  const activeUsers = new Set();
+  console.log(`Transmitiendo a sala ${roomId}. Usuarios activos: ${Array.from(room).join(', ')}`);
+
   room.forEach(userId => {
     const ws = userSessions.get(userId);
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      activeUsers.add(userId);
-    } else {
-      room.delete(userId);
-      userSessions.delete(userId);
-    }
-  });
-
-  console.log(`Transmitiendo mensaje a sala ${roomId} (${activeUsers.size} usuarios válidos)`);
-
-  if (activeUsers.size === 0) {
-    console.log(`Eliminando sala vacía: ${roomId}`);
-    rooms.delete(roomId);
-    return;
-  }
-
-  // Transmitir solo a usuarios activos
-  activeUsers.forEach(userId => {
-    const ws = userSessions.get(userId);
-    if (ws && (!sender || ws !== sender)) {
+    if (ws?.readyState === WebSocket.OPEN && (!sender || ws !== sender)) {
       try {
         ws.send(typeof message === 'string' ? message : JSON.stringify(message));
       } catch (error) {
-        console.error(`Error enviando mensaje a usuario ${userId}:`, error);
-        handleDisconnect(ws);
+        console.error(`Error enviando a ${userId}:`, error);
       }
     }
   });
