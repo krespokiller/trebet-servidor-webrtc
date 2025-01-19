@@ -96,7 +96,14 @@ function handleJoin(ws, data) {
   userSessions.set(ws.id, ws);
   ws.roomId = roomId;
 
-  // Notificar solo si hay más de un usuario
+  // Notificar al usuario que se unió (sea el primero o no)
+  ws.send(JSON.stringify({
+    type: 'room_joined',
+    roomId,
+    isFirst: room.size === 1
+  }));
+
+  // Si hay más usuarios, notificar a los demás
   if (room.size > 1) {
     console.log(`Notificando user_joined en sala ${roomId}`);
     broadcastToRoom(roomId, JSON.stringify({
