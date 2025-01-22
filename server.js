@@ -23,7 +23,11 @@ console.log(`ws://${localIP}:${PORT}`);
 console.log('=================================');
 
 // Configuración del servidor
-const wss = new WebSocket.Server({ port: PORT });
+const wss = new WebSocket.Server({ 
+  port: PORT,
+  perMessageDeflate: false, // Deshabilitar compresión para reducir latencia
+  maxPayload: 65536 // Limitar tamaño de mensajes a 64KB
+});
 
 // Estado global
 const rooms = new Map();
@@ -78,8 +82,17 @@ wss.on('connection', (ws) => {
 function handleJoin(ws, data) {
   const { roomId } = data;
   
-  // Verificar si el usuario ya está en la sala
+  // Verificar si existe la sala y está llena
   const existingRoom = rooms.get(roomId);
+  if (existingRoom && existingRoom.size >= 2) {
+    ws.send(JSON.stringify({
+      type: 'error',
+      message: 'Room is full'
+    }));
+    return;
+  }
+  
+  // Verificar si el usuario ya está en la sala
   if (existingRoom?.has(ws.id)) {
     console.log(`Usuario ${ws.id} ya está en la sala ${roomId}`);
     return;
@@ -238,7 +251,7 @@ setInterval(() => {
     ws.isAlive = false;
     ws.ping();
   });
-}, 15000);
+}, 10000); // Reducido de 15000 a 10000
 
 // Agregar limpieza periódica de conexiones muertas
 setInterval(() => {
