@@ -54,6 +54,14 @@ wss.on('connection', (ws) => {
         case 'ice-candidate':
           broadcastToRoom(data.roomId, JSON.stringify(data), ws);
           break;
+        case 'camera-status':
+          // Transmitir el estado de la cámara a todos en la sala
+          broadcastToRoom(data.roomId, JSON.stringify({
+            type: 'camera-status',
+            enabled: data.enabled,
+            userId: ws.id
+          }), ws);
+          break;
         case 'ping':
           ws.send(JSON.stringify({type: 'pong'}));
           break;
