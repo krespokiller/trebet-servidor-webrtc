@@ -26,7 +26,7 @@ console.log('=================================');
 const wss = new WebSocket.Server({ 
   port: PORT,
   perMessageDeflate: false, // Deshabilitar compresión para reducir latencia
-  maxPayload: 65536 // Limitar tamaño de mensajes a 64KB
+  maxPayload: 32768 // Reducir a 32KB para mensajes más pequeños
 });
 
 // Estado global
@@ -121,7 +121,11 @@ function handleJoin(ws, data) {
   ws.send(JSON.stringify({
     type: 'room_joined',
     roomId,
-    isFirst: room.size === 1
+    isFirst: room.size === 1,
+    networkConfig: {
+      isLowBandwidth: true, // Indicar al cliente que use configuración para bajo ancho de banda
+      recommendedBitrate: 256000 // 256 kbps como máximo
+    }
   }));
 
   // Si hay más usuarios, notificar a los demás
