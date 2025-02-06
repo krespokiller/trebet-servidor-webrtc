@@ -63,6 +63,13 @@ wss.on("connection", (ws) => {
         case "ping":
           ws.send(JSON.stringify({ type: "pong" }));
           break;
+        case 'camera-status':
+            broadcastToRoom(data.roomId, JSON.stringify({
+              type: 'camera-status',
+              enabled: data.enabled,
+              userId: ws.id
+            }), ws);
+          break;
       }
     } catch (err) {
       console.error("Error procesando mensaje:", err);
